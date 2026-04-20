@@ -36,8 +36,10 @@ except Exception:
 CONFIG_PATH = Path(__file__).parent / "config.json"
 DEFAULT_CONFIG = {
     "hotkey": "<ctrl>+space",
-    "model": "base.en",          # tiny.en, base.en, small.en, medium.en, large-v3
+    "model": "medium.en",
     "language": "en",
+    "device": "cuda",
+    "compute_type": "float16",
     "input_method": "auto",       # auto, ydotool, xdotool, wtype, clipboard
     "sound_feedback": True,
     "continuous_mode": False,
@@ -121,16 +123,26 @@ def type_text(text, method=None):
         print("[INFO] Trying clipboard fallback...")
         return _type_via_clipboard(text)
 
+def _find_xauthority():
+    """Find the Mutter/XWayland auth file for the current user session."""
+    import glob
+    uid = os.getuid()
+    matches = glob.glob(f"/run/user/{uid}/.mutter-Xwaylandauth.*")
+    return matches[0] if matches else None
+
+
 def _type_via_clipboard(text):
     """Type text by copying to clipboard and simulating paste."""
     session_type = os.environ.get("XDG_SESSION_TYPE", "").lower()
     try:
         if session_type == "wayland":
-            subprocess.run(["wl-copy", "--", text], check=True, timeout=5)
-            # ydotool key: Ctrl(29) down, V(47) down, V up, Ctrl up
+            xauth = _find_xauthority()
+            env = {**os.environ, "DISPLAY": ":0"}
+            if xauth:
+                env["XAUTHORITY"] = xauth
             subprocess.run(
-                ["ydotool", "key", "29:1", "47:1", "47:0", "29:0"],
-                check=True, timeout=5
+                ["xdotool", "type", "--clearmodifiers", "--delay", "0", "--", text],
+                check=True, timeout=30, env=env
             )
         else:
             subprocess.run(
@@ -293,6 +305,8 @@ class WhisperDictation:
         self.recorder = AudioToTextRecorder(
             model=config["model"],
             language=config["language"],
+            device=config["device"],
+            compute_type=config["compute_type"],
             spinner=False,
             sample_rate=16000,
             silero_sensitivity=0.4,
@@ -564,8 +578,21 @@ def run_hotkey_listener(hotkey_str, callback):
 
 # ============ Main ============
 
+def _set_xwayland_keyboard_layout():
+    """Set XWayland keyboard layout to match the system layout."""
+    xauth = _find_xauthority()
+    env = {**os.environ, "DISPLAY": ":0"}
+    if xauth:
+        env["XAUTHORITY"] = xauth
+    subprocess.run(
+        ["setxkbmap", "be"],
+        env=env, capture_output=True
+    )
+
+
 def main():
     save_default_config()
+    _set_xwayland_keyboard_layout()
 
     # Start audio health monitor early (before model load)
     audio_monitor = AudioHealthMonitor()

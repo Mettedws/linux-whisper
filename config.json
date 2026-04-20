@@ -1,8 +1,10 @@
 {
   "hotkey": "alt",
-  "model": "base.en",
+  "model": "medium.en",
   "language": "en",
-  "input_method": "auto",
+  "device": "cuda",
+  "compute_type": "float16",
+  "input_method": "clipboard",
   "sound_feedback": true,
   "continuous_mode": false
 }
