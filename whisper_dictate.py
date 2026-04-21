@@ -348,7 +348,9 @@ class WhisperDictation:
             post_speech_silence_duration=0.6,
             min_length_of_recording=0.5,
             min_gap_between_recordings=0,
-            enable_realtime_transcription=False,
+            enable_realtime_transcription=True,
+            realtime_processing_pause=0.1,
+            on_realtime_transcription_update=self._on_realtime_update,
             on_recording_start=self._on_recording_start,
             on_recording_stop=self._on_recording_stop,
         )
@@ -359,11 +361,14 @@ class WhisperDictation:
         self._watchdog = threading.Thread(target=self._watchdog_loop, daemon=True)
         self._watchdog.start()
 
+    def _on_realtime_update(self, text):
+        print(f"\r[LIVE] {text}          ", end="", flush=True)
+
     def _on_recording_start(self):
         print("[REC] Recording...")
 
     def _on_recording_stop(self):
-        print("[REC] Processing...")
+        print("\n[REC] Processing...")
 
     def _process_text(self, text):
         """Called when transcription is complete."""
@@ -394,8 +399,8 @@ class WhisperDictation:
             with self.lock:
                 self._is_stuck()
 
-    def toggle_recording(self):
-        """Toggle recording on/off."""
+    def start_recording(self):
+        """Start recording immediately on hotkey press."""
         with self.lock:
             self._is_stuck()
 
@@ -403,30 +408,48 @@ class WhisperDictation:
                 print("[BUSY] Still processing previous recording...")
                 return
 
+            if self.is_recording:
+                return
+
+            self.is_recording = True
+            self.is_processing = True
+            self._processing_deadline = time.time() + 30
+
+        play_sound("start")
+
+        def record():
+            try:
+                text = self.recorder.text()
+                self._process_text(text)
+            except Exception as e:
+                print(f"[ERROR] Recording failed: {e}")
+                with self.lock:
+                    self.is_processing = False
+            finally:
+                with self.lock:
+                    self.is_recording = False
+                    self._processing_deadline = 0
+                play_sound("stop")
+
+        threading.Thread(target=record, daemon=True).start()
+
+    def stop_recording(self):
+        """Stop recording and transcribe — called when hotkey held long enough."""
+        with self.lock:
             if not self.is_recording:
-                self.is_recording = True
-                self.is_processing = True
-                self._processing_deadline = time.time() + 30  # 30s safety timeout
+                return
+        self.recorder.stop()
 
-                play_sound("start")
-
-                def record():
-                    try:
-                        text = self.recorder.text()
-                        self._process_text(text)
-                    except Exception as e:
-                        print(f"[ERROR] Recording failed: {e}")
-                        with self.lock:
-                            self.is_processing = False
-                    finally:
-                        with self.lock:
-                            self.is_recording = False
-                            self._processing_deadline = 0
-                        play_sound("stop")
-
-                threading.Thread(target=record, daemon=True).start()
-            else:
-                print("[INFO] Recording will stop when you stop speaking...")
+    def abort_recording(self):
+        """Abort recording without transcribing — called when hotkey released too early."""
+        with self.lock:
+            if not self.is_recording:
+                return
+            self.is_recording = False
+            self.is_processing = False
+            self._processing_deadline = 0
+        print("[ABORT] Released too early — discarded.")
+        self.recorder.abort()
 
 # ============ Hotkey Listener (evdev) ============
 
@@ -519,8 +542,13 @@ def find_keyboard_devices(evdev, ecodes):
             continue
     return devices, permission_denied
 
-def run_hotkey_listener(hotkey_str, callback):
-    """Block forever, listening for the hotkey combo and calling callback."""
+def run_hotkey_listener(hotkey_str, on_start, on_stop, on_abort, hold_seconds=3.0):
+    """Block forever listening for hotkey events.
+
+    Press hotkey → recording starts immediately.
+    Release after hold_seconds → transcribe and type.
+    Release before hold_seconds → silently discard.
+    """
     evdev, ecodes = _init_evdev()
     modifiers, trigger = parse_hotkey_evdev(hotkey_str, ecodes)
 
@@ -528,16 +556,14 @@ def run_hotkey_listener(hotkey_str, callback):
         print(f"[ERROR] Could not parse hotkey trigger key from: {hotkey_str}")
         sys.exit(1)
 
-    # Normalize trigger to a frozenset of keycodes for uniform handling
     if isinstance(trigger, int):
         trigger_keys = frozenset({trigger})
     else:
-        trigger_keys = trigger  # already a frozenset from modifier-only hotkey
+        trigger_keys = trigger
 
     keyboards, permission_denied = find_keyboard_devices(evdev, ecodes)
     if not keyboards:
         total_devices = len(list(Path("/dev/input/").glob("event*")))
-        accessible = total_devices - permission_denied
         print("[ERROR] No keyboard devices found!")
         if permission_denied > 0:
             in_group = os.popen("id -nG").read().split()
@@ -545,7 +571,6 @@ def run_hotkey_listener(hotkey_str, callback):
             if "input" not in in_group:
                 print(f"        Your current session groups: {' '.join(in_group)}")
                 print(f"        The 'input' group is NOT active in this session.")
-                # Check if user is in the group in /etc/group but session hasn't picked it up
                 import grp
                 try:
                     input_members = grp.getgrnam("input").gr_mem
@@ -554,7 +579,6 @@ def run_hotkey_listener(hotkey_str, callback):
                         print(f"        NOTE: '{username}' IS in the 'input' group in /etc/group,")
                         print(f"        but your desktop session hasn't picked it up yet.")
                         print(f"        You must FULLY LOG OUT of your desktop session and log back in.")
-                        print(f"        (Closing a terminal or rebooting a service is not enough.)")
                     else:
                         print("        Add yourself to the 'input' group:")
                         print("          sudo usermod -aG input $USER")
@@ -565,7 +589,6 @@ def run_hotkey_listener(hotkey_str, callback):
                     print("        Then log out of your desktop session and log back in.")
             else:
                 print("        You are in the 'input' group but no keyboard was detected.")
-                print("        Your keyboard may not expose standard key capabilities.")
         else:
             print("        Make sure you're in the 'input' group:")
             print("          sudo usermod -aG input $USER")
@@ -574,38 +597,40 @@ def run_hotkey_listener(hotkey_str, callback):
 
     dev_names = ', '.join(d.name for d in keyboards)
     print(f"[INIT] Listening on: {dev_names}")
+    print(f"[INIT] Press {config['hotkey']} to record — hold {hold_seconds:.0f}s+ to commit, release early to discard.")
 
-    pressed_keys = set()
-    last_trigger = 0
+    pressed_keys: set[int] = set()
+    hold_start: float | None = None
 
     while True:
         try:
-            r, _, _ = select.select(keyboards, [], [], 1.0)
+            r, _, _ = select.select(keyboards, [], [], 0.1)
             for dev in r:
                 try:
                     for event in dev.read():
                         if event.type != ecodes.EV_KEY:
                             continue
-                        if event.value == 1:       # key down
-                            pressed_keys.add(event.code)
-                        elif event.value == 0:     # key up
-                            pressed_keys.discard(event.code)
 
-                        # Trigger on key-down of the trigger key
-                        if event.code in trigger_keys and event.value == 1:
-                            all_mods = all(
-                                any(k in pressed_keys for k in mod_set)
-                                for mod_set in modifiers
-                            )
-                            if all_mods:
-                                now = time.time()
-                                if now - last_trigger > 0.3:  # debounce
-                                    last_trigger = now
-                                    callback()
+                        if event.value == 1:  # key down
+                            pressed_keys.add(event.code)
+                            if event.code in trigger_keys and hold_start is None:
+                                hold_start = time.time()
+                                on_start()
+
+                        elif event.value == 0:  # key up
+                            pressed_keys.discard(event.code)
+                            if event.code in trigger_keys and hold_start is not None:
+                                held = time.time() - hold_start
+                                hold_start = None
+                                if held >= hold_seconds:
+                                    on_stop()
+                                else:
+                                    on_abort()
+
                 except (OSError, IOError):
-                    # Device disconnected, refresh list
                     time.sleep(0.5)
                     keyboards, _ = find_keyboard_devices(evdev, ecodes)
+
         except (OSError, IOError, ValueError):
             time.sleep(1)
             keyboards, _ = find_keyboard_devices(evdev, ecodes)
@@ -654,7 +679,7 @@ def main():
     notify("Whisper Dictate Ready", f"Press {config['hotkey']} to dictate.")
 
     try:
-        run_hotkey_listener(config["hotkey"], dictation.toggle_recording)
+        run_hotkey_listener(config["hotkey"], dictation.start_recording, dictation.stop_recording, dictation.abort_recording)
     except KeyboardInterrupt:
         audio_monitor.stop()
         print("\n[EXIT] Goodbye!")
