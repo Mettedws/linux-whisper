@@ -1,5 +1,5 @@
 {
-  "hotkey": "alt",
+  "hotkey": "scroll_lock",
   "model": "medium.en",
   "language": "en",
   "device": "cuda",

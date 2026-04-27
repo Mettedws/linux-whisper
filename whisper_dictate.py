@@ -82,7 +82,7 @@ def detect_input_method():
 def _has_cmd(cmd):
     return subprocess.run(["which", cmd], capture_output=True).returncode == 0
 
-def type_text(text, method=None):
+def type_text(text, method=None, window_id=None):
     """Type text at cursor using the appropriate tool. Returns True on success."""
     if not text.strip():
         return True
@@ -101,10 +101,11 @@ def type_text(text, method=None):
 
     try:
         if method == "xdotool":
-            subprocess.run(
-                ["xdotool", "type", "--clearmodifiers", "--", text],
-                check=True, timeout=10
-            )
+            cmd = ["xdotool", "type", "--clearmodifiers"]
+            if window_id:
+                cmd += ["--window", window_id]
+            cmd += ["--", text]
+            subprocess.run(cmd, check=True, timeout=10)
         elif method == "ydotool":
             subprocess.run(
                 ["ydotool", "type", "--", text],
@@ -325,6 +326,7 @@ class WhisperDictation:
         self.is_processing = False
         self.lock = threading.Lock()
         self._processing_deadline = 0  # auto-reset safety net
+        self._target_window: str | None = None
 
         print(f"[INIT] Loading Whisper model: {config['model']}")
         print(f"[INIT] This may take a moment on first run...")
@@ -346,6 +348,7 @@ class WhisperDictation:
             silero_sensitivity=0.4,
             webrtc_sensitivity=2,
             post_speech_silence_duration=1.2,
+            pre_recording_buffer_duration=0.5,
             min_length_of_recording=0.5,
             min_gap_between_recordings=0,
             enable_realtime_transcription=True,
@@ -374,7 +377,7 @@ class WhisperDictation:
         """Type transcribed text at cursor."""
         if text and text.strip():
             print(f"[TEXT] {text}")
-            type_text(text + " ")
+            type_text(text + " ", window_id=self._target_window)
 
     def _is_stuck(self):
         """Check if processing has been stuck too long (safety net)."""
@@ -409,6 +412,16 @@ class WhisperDictation:
             self.is_recording = True
             self.is_processing = True
             self._processing_deadline = time.time() + 30
+
+        try:
+            env = _build_display_env()
+            result = subprocess.run(
+                ["xdotool", "getactivewindow"],
+                capture_output=True, text=True, timeout=2, env=env
+            )
+            self._target_window = result.stdout.strip() or None
+        except Exception:
+            self._target_window = None
 
         play_sound("start")
 
@@ -485,6 +498,7 @@ _KEY_NAMES = {
     'up': 'KEY_UP', 'down': 'KEY_DOWN', 'left': 'KEY_LEFT', 'right': 'KEY_RIGHT',
     'home': 'KEY_HOME', 'end': 'KEY_END', 'pageup': 'KEY_PAGEUP', 'pagedown': 'KEY_PAGEDOWN',
     'insert': 'KEY_INSERT', 'pause': 'KEY_PAUSE', 'capslock': 'KEY_CAPSLOCK',
+    'scrolllock': 'KEY_SCROLLLOCK', 'scroll_lock': 'KEY_SCROLLLOCK',
     **{f'f{i}': f'KEY_F{i}' for i in range(1, 13)},
 }
 
@@ -679,7 +693,7 @@ def main():
     notify("Whisper Dictate Ready", f"Press {config['hotkey']} to dictate.")
 
     try:
-        run_hotkey_listener(config["hotkey"], dictation.start_recording, dictation.stop_recording, dictation.abort_recording)
+        run_hotkey_listener(config["hotkey"], dictation.start_recording, dictation.stop_recording, dictation.abort_recording, hold_seconds=1.0)
     except KeyboardInterrupt:
         audio_monitor.stop()
         print("\n[EXIT] Goodbye!")
